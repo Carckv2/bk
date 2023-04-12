@@ -25,6 +25,8 @@
 #include <libxml/parser.h>
 #include <libxml/xinclude.h>
 #include <media/convert.h>
+#include <cutils/properties.h>
+#include <system/audio.h>
 #include <utils/Log.h>
 #include <utils/StrongPointer.h>
 #include <utils/Errors.h>
@@ -333,11 +335,8 @@ status_t PolicySerializer::deserializeCollection(const xmlNode *cur,
                             Trait::collectionTag);
                         return status;
                     }
-                } else if (mIgnoreVendorExtensions && std::get<status_t>(maybeElement) == NO_INIT) {
-                    // Skip a vendor extension element.
-                } else {
-                    return BAD_VALUE;
                 }
+                // Ignore elements that failed to parse, e.g. routes with invalid sinks
             }
         }
         if (!xmlStrcmp(cur->name, reinterpret_cast<const xmlChar*>(Trait::tag))) {
@@ -417,23 +416,32 @@ std::variant<status_t, AudioGainTraits::Element> PolicySerializer::deserialize<A
     }
 }
 
+static bool fixedEarpieceChannels = false;
 template<>
 std::variant<status_t, AudioProfileTraits::Element>
 PolicySerializer::deserialize<AudioProfileTraits>(
-        const xmlNode *cur, AudioProfileTraits::PtrSerializingCtx /*serializingContext*/)
+        const xmlNode *cur, AudioProfileTraits::PtrSerializingCtx serializingContext)
 {
     using Attributes = AudioProfileTraits::Attributes;
+    bool isOutput = serializingContext != nullptr;
 
     std::string samplingRates = getXmlAttribute(cur, Attributes::samplingRates);
     std::string format = getXmlAttribute(cur, Attributes::format);
     std::string channels = getXmlAttribute(cur, Attributes::channelMasks);
+    ChannelTraits::Collection channelsMask = channelMasksFromString(channels, mChannelMasksSeparator.c_str());
+
+    //Some Foxconn devices have wrong earpiece channel mask, leading to no channel mask
+    if(channelsMask.size() == 1 && *channelsMask.begin() == AUDIO_CHANNEL_IN_MONO && isOutput) {
+        fixedEarpieceChannels = true;
+        channelsMask = channelMasksFromString("AUDIO_CHANNEL_OUT_MONO", ",");
+    }
 
     if (mIgnoreVendorExtensions && maybeVendorExtension(format)) {
         ALOGI("%s: vendor extension format \"%s\" skipped", __func__, format.c_str());
         return NO_INIT;
     }
     AudioProfileTraits::Element profile = new AudioProfile(formatFromString(format, gDynamicFormat),
-            channelMasksFromString(channels, mChannelMasksSeparator.c_str()),
+            channelsMask,
             samplingRatesFromString(samplingRates, mSamplingRatesSeparator.c_str()));
 
     profile->setDynamicFormat(profile->getFormat() == gDynamicFormat);
@@ -572,7 +580,11 @@ std::variant<status_t, DevicePortTraits::Element> PolicySerializer::deserialize<
             new DeviceDescriptor(type, name, address, encodedFormats);
 
     AudioProfileTraits::Collection profiles;
-    status_t status = deserializeCollection<AudioProfileTraits>(cur, &profiles, NULL);
+    status_t status;
+    if(audio_is_output_devices(type))
+        status = deserializeCollection<AudioProfileTraits>(cur, &profiles, (AudioProfileTraits::PtrSerializingCtx)1);
+    else
+        status = deserializeCollection<AudioProfileTraits>(cur, &profiles, NULL);
     if (status != NO_ERROR) {
         return status;
     }
@@ -592,6 +604,17 @@ std::variant<status_t, DevicePortTraits::Element> PolicySerializer::deserialize<
     ALOGV("%s: adding device tag %s type %08x address %s", __func__,
           deviceDesc->getName().c_str(), type, deviceDesc->address().c_str());
     return deviceDesc;
+}
+
+char* trim(char * s) {
+    int l = strlen(s);
+
+    if (l > 0) {
+      while (isspace(s[l - 1])) --l;
+      while (*s && isspace(*s)) ++s, --l;
+    }
+
+    return strndup(s, l);
 }
 
 template<>
@@ -641,7 +664,10 @@ std::variant<status_t, RouteTraits::Element> PolicySerializer::deserialize<Route
     while (devTag != NULL) {
         if (strlen(devTag) != 0) {
             sp<PolicyAudioPort> source = ctx->findPortByTagName(devTag);
-            if (source == NULL && !mIgnoreVendorExtensions) {
+            if (source == NULL) {
+                source = ctx->findPortByTagName(trim(devTag));
+	    }
+            if (source == NULL && false) {
                 ALOGE("%s: no source found with name=%s", __func__, devTag);
                 return BAD_VALUE;
             } else if (source == NULL) {
@@ -678,6 +704,7 @@ std::variant<status_t, ModuleTraits::Element> PolicySerializer::deserialize<Modu
         ALOGE("%s: No %s found", __func__, Attributes::name);
         return BAD_VALUE;
     }
+
     uint32_t versionMajor = 0, versionMinor = 0;
     std::string versionLiteral = getXmlAttribute(cur, Attributes::version);
     if (!versionLiteral.empty()) {
@@ -702,6 +729,25 @@ std::variant<status_t, ModuleTraits::Element> PolicySerializer::deserialize<Modu
     status = deserializeCollection<DevicePortTraits>(cur, &devicePorts, NULL);
     if (status != NO_ERROR) {
         return status;
+    }
+    bool shouldEraseA2DP = name == "primary" && property_get_bool("persist.bluetooth.system_audio_hal.enabled", false);
+    if (shouldEraseA2DP) {
+        // Having A2DP ports in the primary audio HAL module will interfere with sysbta
+        // so remove them here. Note that we do not need to explicitly remove the
+        // corresponding routes below, because routes with invalid sinks will be ignored
+        auto iter = devicePorts.begin();
+        while (iter != devicePorts.end()) {
+            auto port = *iter;
+            auto type = port->type();
+            if (type == AUDIO_DEVICE_OUT_BLUETOOTH_A2DP
+                    || type == AUDIO_DEVICE_OUT_BLUETOOTH_A2DP_HEADPHONES
+                    || type == AUDIO_DEVICE_OUT_BLUETOOTH_A2DP_SPEAKER) {
+                ALOGE("Erasing A2DP device port %s", port->getTagName().c_str());
+                iter = devicePorts.erase(iter);
+            } else {
+                iter++;
+            }
+        }
     }
     module->setDeclaredDevices(devicePorts);
 
@@ -755,6 +801,14 @@ std::variant<status_t, ModuleTraits::Element> PolicySerializer::deserialize<Modu
                 }
             }
         }
+    }
+
+    if(fixedEarpieceChannels) {
+        sp<DeviceDescriptor> device =
+            module->getDeclaredDevices().getDeviceFromTagName("Earpiece");
+        if(device != 0)
+            ctx->addDevice(device);
+        fixedEarpieceChannels = false;
     }
     return module;
 }
@@ -890,6 +944,30 @@ status_t PolicySerializer::deserialize(const char *configFile, AudioPolicyConfig
     if (status != NO_ERROR) {
         return status;
     }
+
+   // Remove modules called bluetooth, bluetooth_qti or a2dp, and inject our own
+    if (property_get_bool("persist.bluetooth.system_audio_hal.enabled", false)) {
+	    for (auto it = modules.begin(); it != modules.end(); it++) {
+		    const char *name = (*it)->getName();
+		    if (strcmp(name, "a2dp") == 0 ||
+				    strcmp(name, "a2dpsink") == 0 ||
+				    strcmp(name, "bluetooth") == 0 ||
+				    strcmp(name, "bluetooth_qti") == 0) {
+
+			    ALOGE("Removed module %s\n", name);
+			    it = modules.erase(it);
+		    }
+		    if (it == modules.end()) break;
+	    }
+	    const char* a2dpFileName = "/system/etc/sysbta_audio_policy_configuration.xml";
+	    if (version == "7.0")
+		    a2dpFileName = "/system/etc/sysbta_audio_policy_configuration_7_0.xml";
+	    auto doc = make_xmlUnique(xmlParseFile(a2dpFileName));
+	    xmlNodePtr root = xmlDocGetRootElement(doc.get());
+	    auto maybeA2dpModule = deserialize<ModuleTraits>(root, config);
+	    modules.add(std::get<1>(maybeA2dpModule));
+    }
+
     config->setHwModules(modules);
 
     // Global Configuration
